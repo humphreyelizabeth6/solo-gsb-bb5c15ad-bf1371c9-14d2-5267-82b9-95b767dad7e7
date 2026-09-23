@@ -815,3 +815,55 @@ class SourceGapsResponse(BaseModel):
         None, description="Opaque keyset cursor; pass it back verbatim to fetch the next page"
     )
     gaps: list[SourceGapOut]
+
+
+# ---------------------------------------------------------------------------
+# read-only threshold exposure over one source's published readings
+# ---------------------------------------------------------------------------
+
+class ExposureResponse(BaseModel):
+    session_id: str
+    source_id: str
+    from_: str = Field(
+        ...,
+        validation_alias="from",
+        serialization_alias="from",
+        description="Normalised UTC form of the half-open interval start (inclusive)",
+    )
+    to: str = Field(
+        ...,
+        description="Normalised UTC form of the half-open interval end (exclusive)",
+    )
+    threshold: float = Field(..., description="Finite threshold; the comparison is strict")
+    value_key: Optional[str] = Field(
+        None,
+        description="Top-level key read from object-valued readings; null compares value itself",
+    )
+    above_threshold_seconds: float = Field(
+        ...,
+        description=(
+            "Seconds of [from, to) covered by a published finite value strictly"
+            " above the threshold"
+        ),
+    )
+    covered_seconds: float = Field(
+        ...,
+        description=(
+            "Seconds of [from, to) covered by any valid finite sample (above or"
+            " not); the complementary time is unknown"
+        ),
+    )
+    unknown_seconds: float = Field(
+        ...,
+        description=(
+            "Seconds without a usable value: before the first reading, or under"
+            " a missing/non-finite/boolean reading (no carry-over)"
+        ),
+    )
+    ratio_above: Optional[float] = Field(
+        ...,
+        description=(
+            "above_threshold_seconds / covered_seconds; null when covered_seconds"
+            " is zero (no valid sample anywhere in the interval)"
+        ),
+    )

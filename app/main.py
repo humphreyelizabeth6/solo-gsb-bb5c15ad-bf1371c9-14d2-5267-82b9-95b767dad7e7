@@ -13,6 +13,7 @@ from . import (
     arrival_latency,
     checkpoints,
     correlated,
+    exposure,
     quarantine_audit,
     release_plan,
     retention,
@@ -39,6 +40,7 @@ from .models import (
     CreatedSessionResponse,
     CurrentAlertsResponse,
     CurrentCorrelatedAlertsResponse,
+    ExposureResponse,
     PullResponse,
     QuarantineAuditResponse,
     QuarantineResponse,
@@ -63,7 +65,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -87,7 +89,12 @@ app = FastAPI(
         "read-only arrival-latency endpoint profiles, in one snapshot, each "
         "reading's delay (first received at minus event time) with inclusive "
         "event-time and source filters, returning per-source sample count, "
-        "minimum, maximum and arithmetic mean; negative latencies are kept."
+        "minimum, maximum and arithmetic mean; negative latencies are kept. A "
+        "read-only exposure endpoint measures, in one snapshot, the seconds of "
+        "a source's piecewise-constant published timeline inside a half-open "
+        "[from, to) interval that are strictly above a threshold, alongside "
+        "the valid-sample coverage and unknown seconds (missing, non-finite "
+        "and boolean values do not carry an older value over)."
     ),
     lifespan=lifespan,
 )
@@ -332,6 +339,64 @@ def get_arrival_latency(
             source_id=source_id,
             from_=from_,
             to=to,
+        )
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/exposure",
+    response_model=ExposureResponse,
+    tags=["readings"],
+)
+def get_source_exposure(
+    session_id: str,
+    source_id: Optional[str] = Query(
+        None, description="One declared source of the session to measure"
+    ),
+    from_: Optional[str] = Query(
+        None,
+        alias="from",
+        description="Inclusive event-time interval start (ISO 8601)",
+    ),
+    to: Optional[str] = Query(
+        None, description="Exclusive event-time interval end (ISO 8601)"
+    ),
+    threshold: Optional[str] = Query(
+        None, description="Finite numeric threshold; values strictly above it count"
+    ),
+    value_key: Optional[str] = Query(
+        None,
+        description="Top-level key read from object-valued readings (default: value itself)",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ExposureResponse:
+    """Read-only over-threshold exposure for one source's published timeline.
+
+    Inside one SQLite read snapshot, the source's published readings define a
+    piecewise-constant value timeline over the half-open interval
+    ``[from, to)``: each reading's value holds until the source's next
+    published reading or ``to``, and ``from`` inherits the latest reading at
+    or before it (same-time readings resolve in ``seq`` order, last one
+    wins).  The response reports the seconds strictly above ``threshold``,
+    the seconds covered by any valid finite sample and the unknown seconds;
+    the over-threshold ratio is ``null`` with no coverage, otherwise above /
+    covered.  Missing, non-finite and boolean values create unknown
+    stretches instead of carrying an older value over.  Buffered and
+    quarantined readings never participate and nothing is written.  An
+    invalid interval, a non-finite threshold or an unknown source returns
+    400; an unknown session returns 404.
+    """
+    # Every parameter error must be 400 (not FastAPI's default 422), so the
+    # query params are parsed/validated inside the module, like source-gaps.
+    return ExposureResponse(
+        **exposure.source_exposure(
+            conn,
+            session_id,
+            source_id=source_id,
+            from_=from_,
+            to=to,
+            threshold=threshold,
+            value_key=value_key,
         )
     )
 
