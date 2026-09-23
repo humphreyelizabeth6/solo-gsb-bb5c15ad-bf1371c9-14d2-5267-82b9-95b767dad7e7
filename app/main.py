@@ -13,6 +13,7 @@ from . import (
     arrival_latency,
     checkpoints,
     correlated,
+    exposure,
     quarantine_audit,
     release_plan,
     retention,
@@ -39,6 +40,7 @@ from .models import (
     CreatedSessionResponse,
     CurrentAlertsResponse,
     CurrentCorrelatedAlertsResponse,
+    ExposureResponse,
     PullResponse,
     QuarantineAuditResponse,
     QuarantineResponse,
@@ -63,7 +65,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -332,6 +334,73 @@ def get_arrival_latency(
             source_id=source_id,
             from_=from_,
             to=to,
+        )
+    )
+
+
+@app.get(
+    "/sessions/{session_id}/exposure",
+    response_model=ExposureResponse,
+    tags=["readings"],
+)
+def get_exposure(
+    session_id: str,
+    source_id: Optional[str] = Query(
+        None, description="One declared source of the session to account for"
+    ),
+    from_: Optional[str] = Query(
+        None,
+        alias="from",
+        description="Inclusive event-time lower bound (ISO 8601)",
+    ),
+    to: Optional[str] = Query(
+        None, description="Exclusive event-time upper bound (ISO 8601)"
+    ),
+    threshold: Optional[str] = Query(
+        None,
+        description=(
+            "Finite numeric threshold; seconds whose sampled value is strictly"
+            " greater count as above-threshold"
+        ),
+    ),
+    value_key: Optional[str] = Query(
+        None,
+        description=(
+            "Optional top-level key read from object-valued readings; omit to"
+            " compare the reading value itself"
+        ),
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ExposureResponse:
+    """Read-only per-source threshold exposure over a half-open event-time window.
+
+    Inside one SQLite read snapshot, the source's **published** readings are
+    treated as a step function: each reading's value holds until the source's
+    next published reading (or the query endpoint), the window start inherits
+    the most recent reading at or before it, and simultaneous readings take
+    effect in ``seq`` order (the last one wins).  The response gives the
+    cumulative seconds inside ``[from, to)`` whose value is **strictly above**
+    ``threshold``, the seconds covered by a valid sampled value, and the
+    unknown seconds (no prior reading at the start, or a
+    missing/non-numeric/non-finite/boolean value which does not carry an
+    earlier valid value forward).  ``above_ratio`` is null without valid
+    coverage, otherwise above-threshold seconds divided by covered seconds.
+    Buffered and quarantined readings never participate and nothing is
+    written (watermarks and alerts are untouched).  Invalid bounds/interval,
+    a non-finite threshold or an unknown/blank source return 400; an unknown
+    session returns 404.
+    """
+    # Every parameter error must be 400 (not FastAPI's default 422), so the
+    # query params are parsed/validated inside the module, like source-gaps.
+    return ExposureResponse(
+        **exposure.compute_exposure(
+            conn,
+            session_id,
+            source_id=source_id,
+            from_=from_,
+            to=to,
+            threshold=threshold,
+            value_key=value_key,
         )
     )
 

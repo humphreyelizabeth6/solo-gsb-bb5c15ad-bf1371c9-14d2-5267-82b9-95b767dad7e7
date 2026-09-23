@@ -815,3 +815,56 @@ class SourceGapsResponse(BaseModel):
         None, description="Opaque keyset cursor; pass it back verbatim to fetch the next page"
     )
     gaps: list[SourceGapOut]
+
+
+# ---------------------------------------------------------------------------
+# read-only per-source threshold-exposure accounting
+# ---------------------------------------------------------------------------
+
+class ExposureResponse(BaseModel):
+    session_id: str
+    source_id: str
+    from_: str = Field(
+        ...,
+        validation_alias="from",
+        serialization_alias="from",
+        description="Inclusive event-time lower bound of the half-open window",
+    )
+    to: str = Field(
+        ..., description="Exclusive event-time upper bound of the half-open window"
+    )
+    threshold: float = Field(
+        ..., description="Values strictly greater than this count as above-threshold"
+    )
+    value_key: Optional[str] = Field(
+        None,
+        description="Top-level object key the value is read from; null compares the reading value itself",
+    )
+    above_seconds: float = Field(
+        ...,
+        description=(
+            "Seconds of [from, to) held by a valid sampled value strictly"
+            " greater than threshold"
+        ),
+    )
+    covered_seconds: float = Field(
+        ...,
+        description=(
+            "Seconds of [from, to) covered by a valid finite sampled value"
+            " (above or at/below threshold)"
+        ),
+    )
+    unknown_seconds: float = Field(
+        ...,
+        description=(
+            "Seconds of [from, to) without a usable value: before the first"
+            " reading, or held by a missing/non-numeric/non-finite/boolean"
+            " reading (a missing value_key included)"
+        ),
+    )
+    above_ratio: Optional[float] = Field(
+        ...,
+        description=(
+            "above_seconds / covered_seconds; null when covered_seconds is zero"
+        ),
+    )

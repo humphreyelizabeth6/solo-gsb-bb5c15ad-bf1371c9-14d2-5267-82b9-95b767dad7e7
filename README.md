@@ -50,6 +50,14 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
 逐来源返回样本数、最小/最大延迟与算术平均延迟；**负延迟照实保留**（时钟超前于接收时刻），
 没有匹配读数的来源不出现在结果中，来源结果按 `source_id` 稳定排序。
 
+最后，**阈值暴露时长**接口 `GET /sessions/{session_id}/exposure` 在**同一个 SQLite 读快照**
+内，把某来源的**已发布**读数视为事件时间上的阶跃函数，只读计算半开区间 `[from, to)` 内取值
+**严格高于** `threshold` 的累计秒数：每条读数的值持续到该来源下一条已发布读数或查询终点，
+区间起点继承此前最近一条已发布读数；同一时刻多条读数按 `seq` 顺序以**最后一条**生效；
+缺值、非有限数值（NaN/Infinity）与布尔值形成**未知区间**（不沿用更早的有效值），起点前无
+读数亦为未知。响应返回超阈秒数、有效采样覆盖秒数、未知秒数，以及无有效覆盖时为 `null`、
+否则为“超阈时长 / 有效覆盖时长”的占比。全程只读，不纳入缓冲或隔离读数，不修改告警与水位线。
+
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
@@ -87,7 +95,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 287 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 335 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -822,6 +830,72 @@ curl -s 'localhost:8000/sessions/lab-1/arrival-latency?from=2026-09-21T10:00:00Z
 - 错误码：会话不存在 → 404；非法 `from`/`to`、`from` 晚于 `to`、空白 `source_id`、
   未声明来源 → 400。
 
+### 23. 阈值暴露时长（只读）
+
+`GET /sessions/{session_id}/exposure`
+
+把一个**已声明来源**的**已发布**读数当作事件时间上的**阶跃函数**，只读回答：在半开事件时间
+区间 `[from, to)` 内，有多少秒取值**严格高于**给定 `threshold`？同时给出有效采样覆盖秒数
+与未知秒数。
+
+**取值随时间的持续规则**：
+
+- 每条已发布读数的取值从自己的 `observed_at` 起生效，持续到**同一来源下一条已发布读数**
+  的事件时刻；最后一条读数的取值持续到查询终点 `to`。
+- 区间起点 `from` **继承此前最近的一条已发布读数**（`observed_at <= from`，含恰好等于
+  `from` 的读数）；起点之前不存在任何已发布读数时，到首条读数之前的时间为**未知**。
+- 同一 `observed_at` 有多条读数时，按 `seq` 顺序生效，**以最后一条（seq 最大）为准**。
+- 取值为**缺值（null/键不存在）、非有限数值（NaN/Infinity）、布尔值或非数值**时形成
+  **未知区间**：未知区间**不沿用更早的有效值**，直到下一条有效读数才恢复覆盖。
+- 恰好等于阈值不算超阈（严格比较）；等于阈值的时间仍计入“有效覆盖”，只是不计入超阈。
+
+查询参数（全部通过 query string 传递）：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `source_id` | 是 | 会话已声明来源之一；缺失/空白/未声明 → 400 |
+| `from` | 是 | 区间起点（**含**，ISO 8601，统一按 UTC 归一化） |
+| `to` | 是 | 区间终点（**不含**）；必须严格晚于 `from`，空/倒置区间 → 400 |
+| `threshold` | 是 | 数值阈值（秒数口径无关，有限数值）；缺失、非数字、NaN/Infinity → 400 |
+| `value_key` | 否 | 从对象型读数取该顶层键比较；省略则直接比较读数 `value`；空白 → 400 |
+
+响应字段（时间均为秒，内部以整数微秒精确累计）：
+
+- `above_seconds`：区间内取值为有效有限数且**严格大于** `threshold` 的累计秒数；
+- `covered_seconds`：区间内有**有效采样值**（高于或不高于阈值）覆盖的累计秒数；
+- `unknown_seconds`：未知累计秒数（起点前无读数，或取值缺失/非数值/非有限/布尔/缺键）；
+- `above_ratio`：`covered_seconds = 0` 时为 `null`；否则为
+  `above_seconds / covered_seconds`（超阈时长占**有效覆盖**的比例，而非占整个区间）。
+
+恒等关系：`covered_seconds + unknown_seconds = to - from`。
+
+```bash
+curl -s 'localhost:8000/sessions/lab-1/exposure?source_id=thermometer-a&from=2026-09-21T10:00:00Z&to=2026-09-21T11:00:00Z&threshold=30'
+```
+
+```json
+{
+  "session_id": "lab-1",
+  "source_id": "thermometer-a",
+  "from": "2026-09-21T10:00:00Z",
+  "to": "2026-09-21T11:00:00Z",
+  "threshold": 30.0,
+  "value_key": null,
+  "above_seconds": 900.0,
+  "covered_seconds": 3000.0,
+  "unknown_seconds": 600.0,
+  "above_ratio": 0.3
+}
+```
+
+- **只看已发布读数**：`buffered`（尚未发布）与 `quarantined`（迟到隔离、永不进入已发布
+  时间线）读数都不参与。
+- **严格只读 + 单一读快照**：取值继承、阶跃切分与全部计数在同一个 deferred 读事务（单一
+  一致快照）内完成，绝不写库；其他事务未提交的插入不可见；不改变发布流、水位线、两类告警
+  与检查点。`open` 与 `closed` 会话均可查询（关闭后针对冻结的已发布流计算）。
+- 错误码：会话不存在 → 404；缺失/非法 `from`/`to`、`from` 不严格早于 `to`、缺失/非法或
+  非有限 `threshold`、缺失/空白/未声明 `source_id`、空白 `value_key` → 400。
+
 ## 数据库迁移
 
 建表采用“**幂等基础 schema + 版本化迁移**”：应用启动（FastAPI lifespan）时自动创建
@@ -903,6 +977,7 @@ curl -s 'localhost:8000/sessions/lab-1/arrival-latency?from=2026-09-21T10:00:00Z
 │   ├── quarantine_audit.py # 隔离影响预演：同一读快照内计算隔离读数插入已发布流的位置/邻居/检查点影响
 │   ├── source_gaps.py   # 来源缺口扫描：同一读快照内按来源找已发布相邻读数的超阈缺口（过滤+游标分页）
 │   ├── arrival_latency.py # 到达延迟剖析：同一读快照内按来源统计 first_received_at - observed_at 的样本数/min/max/avg
+│   ├── exposure.py      # 阈值暴露时长：同一读快照内把已发布读数作阶跃函数，计算 [from,to) 严格高于阈值的覆盖/未知秒数与占比
 │   ├── errors.py        # 400/404/409/422 业务异常
 │   ├── cursor.py        # 不透明 keyset 分页游标
 │   ├── database.py      # SQLite schema、版本化迁移、连接、BEGIN IMMEDIATE 事务
@@ -918,8 +993,9 @@ curl -s 'localhost:8000/sessions/lab-1/arrival-latency?from=2026-09-21T10:00:00Z
 │   ├── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
 │   ├── test_retention.py    # 检查点安全清理：dry_run/保护边界/原子删除/幂等/不改变既有语义测试（28 个）
 │   ├── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居时间差/检查点影响/过滤/400/只读测试（44 个）
-│   └── test_source_gaps.py # 来源缺口扫描：相邻配对/严格阈值/微秒精度/闭区间/游标分页/400/只读测试（29 个）
-│   └── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）
+│   ├── test_source_gaps.py # 来源缺口扫描：相邻配对/严格阈值/微秒精度/闭区间/游标分页/400/只读测试（29 个）
+│   ├── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）
+│   └── test_exposure.py   # 阈值暴露时长：阶跃持续/起点继承/同时刻 seq/未知区间/value_key/严格阈值/400/只读/单快照测试（48 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
